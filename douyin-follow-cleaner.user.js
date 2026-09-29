@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Douyin 关注体检 + 批量取关
 // @namespace    codex.local
-// @version      0.2.0
-// @description  扫描我关注的账号（最近作品时间 / 最近5条平均点赞 / 互关状态 / 纯直播），导出 CSV，并按规则批量取关
+// @version      0.3.0
+// @description  用抖音自己的接口扫描关注列表（最近作品时间 / 近5条平均点赞 / 互关状态），导出 CSV，并在关注弹窗里批量取关
 // @match        https://www.douyin.com/*
 // @run-at       document-start
 // @grant        none
@@ -13,345 +13,421 @@
 
   // ======== 规则（可改） ========
   const CFG = {
-    inactiveDays : 30,     // 超过 N 天没发作品 → 建议取关
-    minAvgLikes  : 10000,  // 最近 5 条平均点赞低于这个数 → 建议取关
-    keepMutual   : true,   // 互关的保留
-    keepLiveOnly : true,   // 纯直播（0 作品）保留
-    stepDelayMs  : 1500,   // 打开下一个账号之间的间隔
-    captureWaitMs: 9000,   // 等页面自己把作品数据请求回来
-    maxScroll    : 200,    // 关注列表最多滚动次数
+    inactiveDays   : 30,     // 超过 N 天没发作品 → 建议取关
+    minAvgLikes    : 10000,  // 最近 5 条平均点赞低于这个数 → 建议取关
+    keepMutual     : true,   // 互关的保留
+    keepLiveOnly   : true,   // 0 作品的纯直播号保留
+    apiDelayMs     : 1200,   // 每个账号之间的间隔（太快会被风控 444）
+    backoffMs      : 45000,  // 被风控后的退避时间
+    maxRetry       : 5,      // 单个账号最多重试次数
+    postCount      : 5,      // 取最近几条作品算平均点赞
+    followPageSize : 20,     // 关注列表分页大小
+    unfollowDelay  : 1100    // 取关间隔
   };
   // =============================
 
-  const SKEY = 'dfc_state_v2';
+  const SKEY = 'dfc_state_v3';
+  const API = {
+    following: '/aweme/v1/web/user/following/list/',
+    posts    : '/aweme/v1/web/aweme/post/'
+  };
   const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const $ = s => document.querySelector(s);
 
-  // ---------- 状态（跨页面导航保留） ----------
-  let state = { phase: 'idle', list: [], idx: 0, rows: [], log: [] };
-  try { const s = sessionStorage.getItem(SKEY); if (s) state = JSON.parse(s); } catch (e) {}
-  const saveState = () => { try { sessionStorage.setItem(SKEY, JSON.stringify(state)); } catch (e) {} };
+  // ---------- 状态（存 sessionStorage，刷新可续跑） ----------
+  let state = { phase: 'idle', self: null, users: [], rows: [], idx: 0, queue: [], qidx: 0, nOk: 0, nMiss: 0, backoffs: 0, log: [] };
+  try { const s = sessionStorage.getItem(SKEY); if (s) state = Object.assign(state, JSON.parse(s)); } catch (e) {}
   if (!state.log) state.log = [];
-  const pushLog = m => { state.log.push(m); if (state.log.length > 60) state.log.shift(); saveState(); };
+  const saveState = () => { try { sessionStorage.setItem(SKEY, JSON.stringify(state)); } catch (e) {} };
+  const paintLog = () => { const el = $('#dfc-log'); if (el) { el.textContent = (state.log || []).join('\n'); el.scrollTop = 1e6; } };
+  const pushLog = m => {
+    state.log.push('[' + new Date().toTimeString().slice(0, 8) + '] ' + m);
+    if (state.log.length > 80) state.log.shift();
+    saveState();
+    paintLog();
+  };
 
-  // ---------- 抓页面自己发出的接口响应（带签名的真实数据） ----------
-  const captured = { users: [], awemes: [] };
-  const seenObj = new Set();
-  function absorb(obj, depth) {
-    if (!obj || typeof obj !== 'object' || depth > 12 || seenObj.has(obj)) return;
-    seenObj.add(obj);
-    if (Array.isArray(obj)) { for (const v of obj) absorb(v, depth + 1); return; }
-    const ct = obj.create_time || obj.createTime;
-    const st = obj.statistics || obj.stats;
-    if (ct && st && (st.digg_count !== undefined || st.diggCount !== undefined)) {
-      captured.awemes.push({
-        id: obj.aweme_id || obj.awemeId || String(Math.random()),
-        ct: Number(ct),
-        digg: Number(st.digg_count ?? st.diggCount ?? 0),
-      });
-    }
-    if (obj.nickname && (obj.aweme_count !== undefined || obj.sec_uid || obj.unique_id)) {
-      captured.users.push({
-        works: Number(obj.aweme_count ?? obj.awemeCount ?? -1),
-        totalLikes: Number(obj.total_favorited ?? obj.totalFavorited ?? -1),
-        followStatus: obj.follow_status ?? obj.followStatus ?? null,
-        followerStatus: obj.follower_status ?? obj.followerStatus ?? null,
-      });
-    }
-    for (const k in obj) {
-      const v = obj[k];
-      if (v && typeof v === 'object') absorb(v, depth + 1);
-      else if (typeof v === 'string' && v.length > 20 && (v[0] === '{' || v[0] === '[')) {
-        try { absorb(JSON.parse(v), depth + 1); } catch (e) {}
-      }
-    }
-  }
-  const isWanted = u => /aweme\/post|aweme\/v1\/web\/user|user\/profile|user\/detail|aweme\/v1\/web\/aweme\/detail/.test(u || '');
-
+  // ---------- 偷看页面自己的请求，拿到自己的 user_id / sec_user_id ----------
+  const seenListUrls = [];
   (function hookNetwork() {
     try {
-      const XO = XMLHttpRequest.prototype.open, XS = XMLHttpRequest.prototype.send;
-      XMLHttpRequest.prototype.open = function (m, u, ...rest) { this.__dfcUrl = u; return XO.call(this, m, u, ...rest); };
-      XMLHttpRequest.prototype.send = function (...args) {
-        this.addEventListener('load', () => {
-          try { if (isWanted(this.__dfcUrl)) absorb(JSON.parse(this.responseText), 0); } catch (e) {}
-        });
-        return XS.apply(this, args);
+      const XO = XMLHttpRequest.prototype.open;
+      XMLHttpRequest.prototype.open = function (m, u, ...rest) {
+        try { if (u && String(u).indexOf('/user/following/list') >= 0) seenListUrls.push(String(u)); } catch (e) {}
+        return XO.call(this, m, u, ...rest);
       };
       const of = window.fetch;
-      window.fetch = async function (...args) {
-        const res = await of.apply(this, args);
+      window.fetch = function (...args) {
         try {
-          const u = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url);
-          if (isWanted(u)) res.clone().json().then(j => absorb(j, 0)).catch(() => {});
+          const u = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
+          if (String(u).indexOf('/user/following/list') >= 0) seenListUrls.push(String(u));
         } catch (e) {}
-        return res;
+        return of.apply(this, args);
       };
     } catch (e) {}
   })();
 
-  // ---------- DOM 兜底 ----------
-  function readFromDom() {
-    const txt = (document.body && document.body.innerText) || '';
-    const works = (txt.match(/作品\s*(\d+)/) || [])[1];
-    const likes = (txt.match(/获赞\s*([\d.]+万?)/) || [])[1];
-    const items = document.querySelectorAll('[data-e2e="user-post-item"]');
-    const likes5 = [];
-    [...items].slice(0, 5).forEach(el => {
-      const t = (el.innerText || '').replace(/\s+/g, ' ');
-      const m = t.match(/([\d.]+万?)\s*$/);
-      if (m) likes5.push(m[1]);
-    });
-    return { works: works ? Number(works) : null, totalLikes: likes || null, likes5 };
+  function selfFromCapture() {
+    const u = seenListUrls[seenListUrls.length - 1] || '';
+    const qi = u.indexOf('?');
+    if (qi < 0) return null;
+    const q = new URLSearchParams(u.slice(qi + 1));
+    const out = { user_id: q.get('user_id'), sec_user_id: q.get('sec_user_id'), webid: q.get('webid'), uifid: q.get('uifid') };
+    return (out.user_id && out.sec_user_id) ? out : null;
   }
-  const toNum = s => {
-    if (s === null || s === undefined) return null;
-    if (typeof s === 'number') return s;
-    const t = String(s).trim();
-    if (!t) return null;
-    if (t.endsWith('万')) return Math.round(parseFloat(t) * 10000);
-    if (t.endsWith('亿')) return Math.round(parseFloat(t) * 100000000);
-    const n = parseFloat(t.replace(/,/g, ''));
-    return isNaN(n) ? null : Math.round(n);
+
+  const COMMON = () => {
+    const c = {
+      device_platform: 'webapp', aid: '6383', channel: 'channel_pc_web',
+      pc_client_type: '1', version_code: '170400', version_name: '17.4.0',
+      cookie_enabled: 'true', screen_width: String(screen.width), screen_height: String(screen.height),
+      browser_language: navigator.language || 'zh-CN', browser_platform: navigator.platform || 'MacIntel',
+      browser_name: 'Chrome', browser_version: '154.0.0.0', browser_online: 'true',
+      engine_name: 'Blink', engine_version: '154.0.0.0',
+      os_name: 'Mac OS', os_version: '10.15.7', platform: 'PC',
+      downlink: '10', effective_type: '4g', round_trip_time: '0'
+    };
+    if (state.self && state.self.webid) c.webid = state.self.webid;
+    if (state.self && state.self.uifid) c.uifid = state.self.uifid;
+    return c;
   };
+  const apiGet = (path, extra) =>
+    fetch(path + '?' + new URLSearchParams(Object.assign({}, COMMON(), extra)).toString(), { credentials: 'include' });
 
   // ---------- 判定 ----------
+  const isMutual = u => u.followStatus === 2 || (u.followStatus === 1 && u.followerStatus === 1);
+
   function decide(r) {
     if (CFG.keepMutual && r.mutual) return '互关-保留';
-    if (r.works === 0 && CFG.keepLiveOnly) return '纯直播-保留';
-    if (r.lastPostDays !== null && r.lastPostDays > CFG.inactiveDays) return '超' + CFG.inactiveDays + '天未更新-取关';
-    if (r.avgLikes !== null && r.avgLikes < CFG.minAvgLikes) return '平均点赞<' + (CFG.minAvgLikes / 10000) + 'w-取关';
-    if (r.avgLikes === null && r.lastPostDays === null) return '读不到数据-人工看';
+    if (!(r.works > 0) && CFG.keepLiveOnly) return '纯直播-保留';
+    if (r.src === 'nodata') return '读不到数据-人工看';
+    if (r.lastPostDays !== null && r.lastPostDays !== undefined && r.lastPostDays > CFG.inactiveDays) return '超' + CFG.inactiveDays + '天未更新-取关';
+    if (r.avgLikes !== null && r.avgLikes !== undefined && r.avgLikes < CFG.minAvgLikes) return '近5条均赞<' + (CFG.minAvgLikes / 10000) + 'w-取关';
+    if ((r.avgLikes === null || r.avgLikes === undefined) && (r.lastPostDays === null || r.lastPostDays === undefined)) return '读不到数据-人工看';
     return '保留';
   }
 
-  // ---------- 扫描：逐个打开主页 ----------
-  async function scanCurrentProfile() {
-    const t0 = Date.now();
-    while (Date.now() - t0 < CFG.captureWaitMs) {
-      if (captured.awemes.length || captured.users.length) break;
-      await sleep(400);
-    }
-    const cur = state.list[state.idx] || {};
-    const user = captured.users.sort((a, b) => (b.works || -1) - (a.works || -1))[0] || null;
-    const uniq = new Map();
-    captured.awemes.forEach(a => uniq.set(a.id, a));
-    const awemes = [...uniq.values()].sort((a, b) => b.ct - a.ct).slice(0, 5);
-    const dom = readFromDom();
-    const now = Date.now() / 1000;
-    const last = awemes[0];
-    const rec = {
-      name: cur.name, secUid: cur.secUid,
-      works: user && user.works >= 0 ? user.works : dom.works,
-      totalLikes: user && user.totalLikes >= 0 ? user.totalLikes : toNum(dom.totalLikes),
-      mutual: !!(user && user.followStatus === 1 && user.followerStatus === 1),
-      lastPostDays: last ? Math.floor((now - last.ct) / 86400) : null,
-      avgLikes: awemes.length ? Math.round(awemes.reduce((s, a) => s + a.digg, 0) / awemes.length) : null,
-      likes5: awemes.map(a => a.digg).join('/'),
-      source: (user || awemes.length) ? 'api' : 'dom',
-      domSample: dom.likes5.join('/'),
-    };
-    rec.verdict = decide(rec);
-    state.rows.push(rec);
-    saveState();
+  // ---------- ① 扫描 ----------
+  async function openFollowDialog() {
+    const cands = [...document.querySelectorAll('div,span')]
+      .filter(e => e.children.length === 0 && /^\d+$/.test((e.textContent || '').trim()));
+    const t = cands.find(e => e.parentElement && /关注/.test(e.parentElement.textContent || ''));
+    if (!t) return false;
+    t.click();
+    if (t.parentElement) t.parentElement.click();
+    return true;
   }
 
-  // ---------- 关注列表收集（在 /user/self 上） ----------
-  function findScroller() {
-    const a = document.querySelector('a[href*="/user/MS4w"]');
+  async function scanAll() {
+    if (state.phase === 'scan') { pushLog('⚠️ 已经在扫描中了'); return; }
+    const fresh = !state.users.length || confirm('上次已有 ' + state.users.length + ' 条账号记录，其中 ' + state.rows.length + ' 条已取到数据。\n\n确定＝从头重新扫描\n取消＝接着上次继续');
+    if (fresh) { state.users = []; state.rows = []; state.idx = 0; state.log = []; state.backoffs = 0; }
+    state.phase = 'scan'; saveState(); render();
+
+    try {
+      // 自己的身份：需要点开一次关注弹窗，让页面自己发一次列表请求
+      if (!state.self) {
+        pushLog('① 打开关注弹窗，读取自己的账号信息…');
+        const opened = await openFollowDialog();
+        if (!opened) pushLog('⚠️ 没找到「关注 N」入口，手动点开一下也可以');
+        for (let i = 0; i < 20 && !state.self; i++) { state.self = selfFromCapture(); await sleep(700); }
+        if (!state.self) { pushLog('❌ 拿不到自己的 user_id / sec_user_id，手动点开一次「关注」弹窗再重试'); state.phase = 'idle'; saveState(); render(); return; }
+        saveState();
+        pushLog('   身份 OK（user_id=' + state.self.user_id + '）');
+      }
+
+      // 收集关注列表
+      if (!state.users.length) {
+        pushLog('② 拉取关注列表…');
+        const seen = new Map();
+        let offset = 0;
+        while (offset < 4000) {
+          const res = await apiGet(API.following, {
+            user_id: state.self.user_id, sec_user_id: state.self.sec_user_id,
+            offset: String(offset), min_time: '0', max_time: '0', count: String(CFG.followPageSize),
+            source_type: '4', gps_access: '0', address_book_access: '0', is_top: '1', update_version_code: '170400'
+          });
+          if (res.status !== 200) {
+            state.backoffs++; pushLog('⚠️ 列表接口 ' + res.status + '，退避 ' + (CFG.backoffMs / 1000) + 's');
+            saveState(); await sleep(CFG.backoffMs); continue;
+          }
+          const j = await res.json();
+          const list = j.followings || [];
+          for (const u of list) {
+            seen.set(u.sec_uid, {
+              name: u.nickname, secUid: u.sec_uid, works: u.aweme_count, totalLikes: u.total_favorited,
+              followStatus: u.follow_status, followerStatus: u.follower_status, uniqueId: u.unique_id
+            });
+          }
+          state.users = [...seen.values()]; saveState(); render();
+          pushLog('   已收集 ' + seen.size + ' 个');
+          if (!j.has_more || !list.length) break;
+          offset += CFG.followPageSize;
+          await sleep(250);
+        }
+        if (!state.users.length) { pushLog('❌ 一个都没收到，停止'); state.phase = 'idle'; saveState(); render(); return; }
+        pushLog('   共 ' + state.users.length + ' 个，开始逐个取作品数据（每个约 ' + (CFG.apiDelayMs / 1000) + 's）');
+      }
+
+      // 逐个拉最近作品
+      state.idx = state.rows.length;
+      while (state.idx < state.users.length) {
+        const u = state.users[state.idx];
+        const mutual = isMutual(u);
+        if (CFG.keepMutual && mutual) {
+          state.rows.push(Object.assign({}, u, { mutual: true, lastPostDays: null, avgLikes: null, likes5: '', src: 'mutual' }));
+        } else if (!(u.works > 0)) {
+          state.rows.push(Object.assign({}, u, { mutual: false, lastPostDays: null, avgLikes: null, likes5: '', src: 'works0' }));
+        } else {
+          let ok = false;
+          for (let attempt = 0; attempt < CFG.maxRetry && !ok; attempt++) {
+            let res;
+            try {
+              res = await apiGet(API.posts, {
+                sec_user_id: u.secUid, max_cursor: '0', count: String(CFG.postCount),
+                publish_video_strategy_type: '2', version_code: '170400', version_name: '17.4.0'
+              });
+            } catch (e) { res = { status: 0 }; }
+            if (res.status !== 200) {
+              state.backoffs++; pushLog('⚠️ 作品接口 ' + res.status + '（风控），退避 ' + (CFG.backoffMs / 1000) + 's 后重试');
+              saveState(); await sleep(CFG.backoffMs); continue;
+            }
+            const j = await res.json();
+            const list = (j.aweme_list || []).slice().sort((a, b) => b.create_time - a.create_time);
+            const top = list.slice(0, CFG.postCount);
+            const now = Date.now() / 1000;
+            state.rows.push(Object.assign({}, u, {
+              mutual: mutual,
+              lastPostDays: top[0] ? Math.floor((now - top[0].create_time) / 86400) : null,
+              avgLikes: top.length ? Math.round(top.reduce((s, a) => s + ((a.statistics && a.statistics.digg_count) || 0), 0) / top.length) : null,
+              likes5: top.map(a => (a.statistics && a.statistics.digg_count) || 0).join('/'),
+              src: top.length ? 'api' : 'nodata'
+            }));
+            ok = true;
+          }
+          if (!ok) state.rows.push(Object.assign({}, u, { mutual: mutual, lastPostDays: null, avgLikes: null, likes5: '', src: 'failed' }));
+        }
+        state.idx++;
+        saveState(); render();
+        if (state.idx % 20 === 0) pushLog('   进度 ' + state.idx + ' / ' + state.users.length);
+        await sleep(CFG.apiDelayMs);
+      }
+
+      state.phase = 'done';
+      const kill = state.rows.filter(r => (decide(r) || '').indexOf('取关') >= 0).length;
+      pushLog('✅ 扫描完成：' + state.rows.length + ' 条，建议取关 ' + kill + ' 个' + (state.backoffs ? '（退避 ' + state.backoffs + ' 次）' : ''));
+    } catch (e) {
+      pushLog('❌ 扫描出错：' + (e && e.message ? e.message : e));
+    }
+    saveState(); render();
+  }
+
+  // ---------- ③ 批量取关（关注弹窗里用搜索框定位，再点「已关注」） ----------
+  const visibleInput = () => {
+    const ins = [...document.querySelectorAll('input')].filter(i => i.placeholder === '搜索用户名字或抖音号');
+    for (const i of ins) {
+      const r = i.getBoundingClientRect();
+      if (r.width < 40) continue;
+      const h = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+      if (h && (i === h || i.contains(h) || h.contains(i))) return i;
+    }
+    return ins.find(i => i.getBoundingClientRect().width > 40) || null;
+  };
+  const setInput = (el, v) => {
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+    setter.call(el, v);
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+  };
+  const followBtnOf = secUid => {
+    const a = document.querySelector('a[href*="/user/' + secUid + '"]');
     if (!a) return null;
-    let el = a.parentElement;
+    let el = a;
     while (el && el !== document.body) {
-      if (el.scrollHeight > el.clientHeight + 80) return el;
+      const b = el.querySelector && el.querySelector('button');
+      if (b && /^(已关注|关注)$/.test(b.textContent.trim())) return b;
       el = el.parentElement;
     }
-    return document.scrollingElement;
-  }
-  async function collectFollowList() {
-    const map = new Map();
-    const sc = findScroller();
-    if (!sc) { pushLog('❌ 找不到关注列表容器（先点开「关注 366」弹窗）'); return []; }
-    let stall = 0, lastCount = 0;
-    for (let i = 0; i < CFG.maxScroll; i++) {
-      document.querySelectorAll('a[href*="/user/MS4w"]').forEach(a => {
-        const name = (a.textContent || '').trim().replace(/\s+/g, ' ');
-        const secUid = a.getAttribute('href').split('/user/')[1].split('?')[0];
-        if (name && secUid) map.set(secUid, { name, secUid });
-      });
-      if (map.size === lastCount) stall++; else stall = 0;
-      lastCount = map.size;
-      pushLog('   已收集 ' + map.size + ' 个');
-      if (stall >= 4) break;
-      sc.scrollTop = sc.scrollTop + Math.max(400, sc.clientHeight * 0.8);
-      await sleep(700);
+    return null;
+  };
+
+  async function unfollowOne(secUid, name, uniqueId) {
+    const keys = [];
+    if (uniqueId && String(uniqueId).trim()) keys.push(String(uniqueId).trim());
+    keys.push(name, (name || '').slice(0, 4), (name || '').slice(0, 3));
+    const inp = visibleInput();
+    if (!inp) return 'no-input';
+    for (const k of keys) {
+      if (!k) continue;
+      setInput(inp, k);
+      await sleep(1500);
+      let b = followBtnOf(secUid);
+      if (!b) { await sleep(900); b = followBtnOf(secUid); }
+      if (!b) continue;
+      if (b.textContent.trim() !== '已关注') { setInput(inp, ''); await sleep(400); return 'already'; }
+      b.click();
+      await sleep(1000);
+      const b2 = followBtnOf(secUid);
+      const txt = b2 ? b2.textContent.trim() : 'gone';
+      setInput(inp, '');
+      await sleep(500);
+      return txt === '已关注' ? 'fail' : 'ok';
     }
-    return [...map.values()];
+    setInput(inp, '');
+    await sleep(400);
+    return 'miss';
+  }
+
+  async function unfollowAll() {
+    const checked = [...document.querySelectorAll('#dfc-box input[type=checkbox][data-uid]')].filter(c => c.checked).map(c => c.dataset.uid);
+    if (!checked.length) { pushLog('没有勾选任何账号'); return; }
+    const names = checked.map(uid => { const r = state.rows.find(x => x.secUid === uid) || {}; return r.name || uid; });
+    if (!confirm('准备取关 ' + checked.length + ' 个账号：\n\n' + names.slice(0, 20).join('、') + (names.length > 20 ? ' …等' : '') + '\n\n确定继续？')) return;
+    if (!visibleInput()) {
+      pushLog('③ 先把「关注」弹窗打开…');
+      await openFollowDialog();
+      await sleep(2500);
+    }
+    if (!visibleInput()) { pushLog('❌ 找不到关注弹窗的搜索框，停止'); return; }
+
+    state.phase = 'unfollow';
+    state.queue = checked;
+    state.qidx = 0;
+    saveState();
+    pushLog('③ 开始取关，共 ' + state.queue.length + ' 个');
+    while (state.qidx < state.queue.length) {
+      const uid = state.queue[state.qidx];
+      const r = state.rows.find(x => x.secUid === uid) || {};
+      const out = await unfollowOne(uid, r.name, r.uniqueId);
+      if (out === 'ok') { state.nOk++; }
+      else if (out === 'fail') { state.backoffs++; pushLog('⚠️ ' + r.name + ' 取关失败，稍后重试'); await sleep(3000); continue; }
+      else if (out === 'miss') { state.nMiss++; pushLog('⚠️ 搜不到 ' + r.name + '，跳过'); }
+      else if (out === 'no-input') { pushLog('❌ 搜索框没了，停止'); break; }
+      state.qidx++;
+      saveState();
+      if (state.qidx % 10 === 0) pushLog('   已取关 ' + state.nOk + ' / ' + state.queue.length);
+      await sleep(CFG.unfollowDelay);
+    }
+    state.phase = 'done'; state.queue = []; state.qidx = 0; saveState();
+    pushLog('✅ 取关结束：成功 ' + state.nOk + '，搜不到 ' + state.nMiss);
+  }
+
+  // ---------- 导出 CSV ----------
+  function exportCsv() {
+    const cols = ['昵称', 'secUid', '作品数', '总获赞', '最近更新天数', '近5条平均赞', '近5条点赞', '互关', '数据源', '判定'];
+    const esc = v => '"' + String(v === undefined || v === null ? '' : v).replace(/"/g, '""') + '"';
+    const body = (state.rows || []).map(r =>
+      [r.name, r.secUid, r.works, r.totalLikes, r.lastPostDays, r.avgLikes, r.likes5, r.mutual ? '是' : '否', r.src, decide(r)].map(esc).join(','));
+    const csv = '\uFEFF' + cols.join(',') + '\n' + body.join('\n');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+    a.download = 'douyin-following-audit.csv';
+    a.click();
+    pushLog('已导出 CSV');
   }
 
   // ---------- UI ----------
-  function buildPanel() {
-    if (document.getElementById('dfc-box')) return;
-    const box = document.createElement('div');
-    box.id = 'dfc-box';
-    box.style.cssText = 'position:fixed;right:16px;top:80px;width:560px;max-height:78vh;z-index:999999;' +
-      'background:#181b21;color:#e6e6e6;font:12px/1.5 -apple-system,"PingFang SC",sans-serif;border:1px solid #333;' +
-      'border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.5);display:flex;flex-direction:column;overflow:hidden';
-    box.innerHTML = `
-      <div id="dfc-head" style="padding:8px 10px;background:#23262d;cursor:move;display:flex;justify-content:space-between">
-        <b>抖音关注体检 v0.2</b><span id="dfc-close" style="cursor:pointer">✕</span>
-      </div>
-      <div style="padding:8px 10px;display:flex;gap:6px;flex-wrap:wrap;border-bottom:1px solid #2b2f37">
-        <button id="dfc-scan">① 打开关注列表并扫描</button>
-        <button id="dfc-csv">② 导出 CSV</button>
-        <button id="dfc-unfollow">③ 批量取关勾选项</button>
-        <button id="dfc-diag">复制诊断</button>
-        <button id="dfc-clear">清空</button>
-      </div>
-      <div id="dfc-log" style="padding:6px 10px;height:96px;overflow:auto;background:#12141a;color:#8fb98f;white-space:pre-wrap"></div>
-      <div id="dfc-table" style="overflow:auto;flex:1"></div>`;
-    document.body.appendChild(box);
-    const $ = id => box.querySelector(id);
-    const paintLog = () => { const el = $('#dfc-log'); el.textContent = (state.log || []).join('\n'); el.scrollTop = 1e6; };
-    paintLog();
-    $('#dfc-close').onclick = () => box.remove();
-    $('#dfc-clear').onclick = () => { state = { phase: 'idle', list: [], idx: 0, rows: [], log: [] }; saveState(); paintLog(); render(); };
-    $('#dfc-diag').onclick = () => {
-      const t = 'phase=' + state.phase + ' list=' + state.list.length + ' idx=' + state.idx + ' rows=' + state.rows.length + '\n' +
-        'captured.users=' + captured.users.length + ' captured.awemes=' + captured.awemes.length + '\n' + (state.log || []).slice(-20).join('\n');
-      navigator.clipboard.writeText(t).then(() => alert('诊断信息已复制，粘贴给我'), () => alert(t));
-    };
-    (() => { let sx, sy, ox, oy, d = false;
-      $('#dfc-head').addEventListener('mousedown', e => { d = true; sx = e.clientX; sy = e.clientY;
-        const r = box.getBoundingClientRect(); ox = r.left; oy = r.top; e.preventDefault(); });
-      window.addEventListener('mousemove', e => { if (!d) return;
-        box.style.left = (ox + e.clientX - sx) + 'px'; box.style.top = (oy + e.clientY - sy) + 'px'; box.style.right = 'auto'; });
-      window.addEventListener('mouseup', () => d = false);
-    })();
-
-    $('#dfc-scan').onclick = async () => {
-      state.phase = 'collect'; state.list = []; state.idx = 0; state.rows = []; state.log = [];
-      pushLog('① 打开关注列表…');
-      const clickable = [...document.querySelectorAll('div,span')]
-        .find(e => e.children.length === 0 && /^\d+$/.test((e.textContent || '').trim()) &&
-                   e.previousElementSibling && /关注/.test(e.previousElementSibling.textContent || ''));
-      if (clickable) clickable.click(); else pushLog('⚠️ 没找到「关注 N」入口，直接尝试读列表');
-      await sleep(2500);
-      pushLog('② 滚动收集账号…');
-      const list = await collectFollowList();
-      if (!list.length) { pushLog('❌ 一个都没收到，停止'); state.phase = 'idle'; saveState(); return; }
-      state.list = list; state.idx = 0; state.phase = 'scan';
-      pushLog('   共 ' + list.length + ' 个，开始逐个打开主页（每个约 3-10 秒）');
-      saveState();
-      location.href = 'https://www.douyin.com/user/' + list[0].secUid;
-    };
-
-    function render() {
-      const head = ['', '昵称', '作品', '总赞', '最近更新', '近5条均赞', '数据源', '判定'];
-      let h = '<table style="width:100%;border-collapse:collapse"><thead><tr>' +
-        head.map(x => '<th style="text-align:left;padding:4px 6px;border-bottom:1px solid #2b2f37;position:sticky;top:0;background:#181b21">' + x + '</th>').join('') +
-        '</tr></thead><tbody>';
-      for (const r of (state.rows || []).slice(0, 500)) {
-        const kill = (r.verdict || '').includes('取关');
-        h += '<tr style="border-bottom:1px solid #22252b">' +
-          '<td style="padding:3px 6px">' + (kill ? '<input type="checkbox" data-uid="' + r.secUid + '" checked>' : '') + '</td>' +
-          '<td style="padding:3px 6px;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + (r.name || '') + '</td>' +
-          '<td style="padding:3px 6px">' + (r.works ?? '-') + '</td>' +
-          '<td style="padding:3px 6px">' + (r.totalLikes ?? '-') + '</td>' +
-          '<td style="padding:3px 6px">' + (r.lastPostDays === null ? '-' : r.lastPostDays + '天前') + '</td>' +
-          '<td style="padding:3px 6px">' + (r.avgLikes ?? '-') + '</td>' +
-          '<td style="padding:3px 6px;color:#888">' + (r.source || '') + '</td>' +
-          '<td style="padding:3px 6px;color:' + (kill ? '#ff8080' : '#8fb98f') + '">' + (r.verdict || '') + '</td></tr>';
-      }
-      $('#dfc-table').innerHTML = h + '</tbody></table>';
+  function render() {
+    const box = $('#dfc-box');
+    if (!box) return;
+    const rows = state.rows || [];
+    const kill = rows.filter(r => (decide(r) || '').indexOf('取关') >= 0);
+    $('#dfc-status').textContent = state.phase === 'scan'
+      ? '扫描中 ' + state.idx + ' / ' + (state.users.length || '?') + '（建议取关 ' + kill.length + '）'
+      : rows.length ? '共 ' + rows.length + ' 条，建议取关 ' + kill.length + ' 个' : '还没扫描';
+    $('#dfc-csv').disabled = !rows.length;
+    $('#dfc-unfollow').disabled = !kill.length;
+    const head = ['', '昵称', '作品', '总赞', '最近更新', '近5均赞', '数据源', '判定'];
+    let h = '<table style="width:100%;border-collapse:collapse"><thead><tr>' +
+      head.map(x => '<th style="text-align:left;padding:4px 6px;border-bottom:1px solid #2b2f37;position:sticky;top:0;background:#181b21">' + x + '</th>').join('') +
+      '</tr></thead><tbody>';
+    for (const r of rows.slice(0, 800)) {
+      const v = decide(r);
+      const bad = v.indexOf('取关') >= 0;
+      h += '<tr style="border-bottom:1px solid #22252b">' +
+        '<td style="padding:3px 6px">' + (bad ? '<input type="checkbox" data-uid="' + r.secUid + '" checked>' : '') + '</td>' +
+        '<td style="padding:3px 6px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + (r.name || '') + '</td>' +
+        '<td style="padding:3px 6px">' + (r.works === undefined || r.works === null ? '-' : r.works) + '</td>' +
+        '<td style="padding:3px 6px">' + (r.totalLikes === undefined || r.totalLikes === null ? '-' : r.totalLikes) + '</td>' +
+        '<td style="padding:3px 6px">' + (r.lastPostDays === null || r.lastPostDays === undefined ? '-' : r.lastPostDays + '天前') + '</td>' +
+        '<td style="padding:3px 6px">' + (r.avgLikes === null || r.avgLikes === undefined ? '-' : r.avgLikes) + '</td>' +
+        '<td style="padding:3px 6px;color:#888">' + (r.src || '') + '</td>' +
+        '<td style="padding:3px 6px;color:' + (bad ? '#ff8080' : '#8fb98f') + '">' + v + '</td></tr>';
     }
-
-    $('#dfc-csv').onclick = () => {
-      const cols = ['昵称', 'secUid', '作品数', '总获赞', '最近更新天数', '近5条平均赞', '近5条点赞', '互关', '数据源', '判定'];
-      const esc = v => '"' + String(v === undefined || v === null ? '' : v).replace(/"/g, '""') + '"';
-      const body = (state.rows || []).map(r => [r.name, r.secUid, r.works, r.totalLikes, r.lastPostDays, r.avgLikes, r.likes5, r.mutual ? '是' : '否', r.source, r.verdict].map(esc).join(','));
-      const csv = '\uFEFF' + cols.join(',') + '\n' + body.join('\n');
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
-      a.download = 'douyin-following-audit.csv';
-      a.click();
-      pushLog('已导出 CSV');
-    };
-
-    $('#dfc-unfollow').onclick = () => {
-      const uids = [...box.querySelectorAll('input[type=checkbox][data-uid]')].filter(c => c.checked).map(c => c.dataset.uid);
-      if (!uids.length) { pushLog('没有勾选任何账号'); return; }
-      const names = (state.rows || []).filter(r => uids.includes(r.secUid)).map(r => r.name);
-      if (!confirm('准备取关 ' + uids.length + ' 个账号：\n\n' + names.slice(0, 20).join('、') + (names.length > 20 ? ' …' : '') + '\n\n确定继续？')) return;
-      state.phase = 'unfollow'; state.queue = uids; state.uidx = 0; saveState();
-      pushLog('开始取关，逐个打开主页点按钮…');
-      location.href = 'https://www.douyin.com/user/' + uids[0];
-    };
-
-    render();
-    window.__dfcRender = render;
+    $('#dfc-table').innerHTML = h + '</tbody></table>';
+    paintLog();
   }
 
-  // ---------- 取关流程（在目标主页上） ----------
-  async function runUnfollowOnProfile() {
-    const uid = state.queue[state.uidx];
-    const rec = (state.rows || []).find(r => r.secUid === uid) || {};
-    await sleep(2500);
-    const btn = [...document.querySelectorAll('button,div,span')]
-      .find(e => e.children.length === 0 && /^(已关注|互相关注)$/.test((e.textContent || '').trim()));
-    if (btn) {
-      btn.click();
-      await sleep(600);
-      const cfm = [...document.querySelectorAll('button,div,span')]
-        .find(e => e.children.length === 0 && /^(确定|确认|取消关注)$/.test((e.textContent || '').trim()));
-      if (cfm) { cfm.click(); await sleep(500); }
-      pushLog('✅ 已取关 ' + (rec.name || uid) + '（' + (state.uidx + 1) + '/' + state.queue.length + '）');
-    } else {
-      pushLog('⚠️ ' + (rec.name || uid) + ' 没找到「已关注」按钮，跳过');
-    }
-    state.uidx++;
-    saveState();
-    if (state.uidx < state.queue.length) {
-      await sleep(1200);
-      location.href = 'https://www.douyin.com/user/' + state.queue[state.uidx];
-    } else {
-      pushLog('🎉 取关流程结束，共处理 ' + state.queue.length + ' 个');
-      state.phase = 'done';
-      saveState();
-      location.href = 'https://www.douyin.com/user/self';
-    }
+  function buildPanel() {
+    if ($('#dfc-box')) return;
+    const box = document.createElement('div');
+    box.id = 'dfc-box';
+    box.style.cssText = 'position:fixed;right:16px;top:80px;width:600px;max-height:78vh;z-index:999999;' +
+      'background:#181b21;color:#e6e6e6;font:12px/1.5 -apple-system,"PingFang SC",sans-serif;border:1px solid #333;' +
+      'border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.5);display:flex;flex-direction:column;overflow:hidden';
+    box.innerHTML =
+      '<div id="dfc-head" style="padding:8px 10px;background:#23262d;cursor:move;display:flex;justify-content:space-between">' +
+        '<b>抖音关注体检 v0.3</b><span id="dfc-close" style="cursor:pointer">✕</span></div>' +
+      '<div style="padding:8px 10px;display:flex;gap:6px;flex-wrap:wrap;border-bottom:1px solid #2b2f37">' +
+        '<button id="dfc-scan">① 扫描关注列表</button>' +
+        '<button id="dfc-csv">② 导出 CSV</button>' +
+        '<button id="dfc-unfollow">③ 批量取关勾选项</button>' +
+        '<button id="dfc-diag">复制诊断</button>' +
+        '<button id="dfc-clear">清空</button>' +
+        '<span id="dfc-status" style="align-self:center;color:#8fb98f"></span></div>' +
+      '<div id="dfc-table" style="overflow:auto;max-height:46vh"></div>' +
+      '<pre id="dfc-log" style="margin:0;padding:8px 10px;height:130px;overflow:auto;background:#11131a;color:#9aa0aa;font-size:11px;white-space:pre-wrap"></pre>';
+    document.body.appendChild(box);
+    box.querySelectorAll('button').forEach(b => {
+      b.style.cssText = 'background:#2b3038;color:#e6e6e6;border:1px solid #3a4150;border-radius:6px;padding:4px 8px;cursor:pointer';
+    });
+
+    $('#dfc-close').onclick = () => box.remove();
+    $('#dfc-scan').onclick = () => scanAll();
+    $('#dfc-csv').onclick = () => exportCsv();
+    $('#dfc-unfollow').onclick = () => unfollowAll();
+    $('#dfc-clear').onclick = () => {
+      state = { phase: 'idle', self: null, users: [], rows: [], idx: 0, queue: [], qidx: 0, nOk: 0, nMiss: 0, backoffs: 0, log: [] };
+      saveState(); render();
+    };
+    $('#dfc-diag').onclick = () => {
+      const d = [
+        'phase=' + state.phase, 'users=' + state.users.length, 'rows=' + state.rows.length, 'idx=' + state.idx,
+        'backoffs=' + state.backoffs, 'ok=' + state.nOk, 'miss=' + state.nMiss,
+        'self=' + (state.self ? state.self.user_id : 'null'),
+        'scrollers=' + [...document.querySelectorAll('div.aQVXLJB7')].length,
+        'cards=' + document.querySelectorAll('div.OlxToPIh').length
+      ].join(' | ');
+      const txt = d + '\n' + (state.log || []).slice(-20).join('\n');
+      navigator.clipboard.writeText(txt).then(() => pushLog('诊断信息已复制'), () => pushLog(txt));
+    };
+    // 拖动面板
+    (() => {
+      let sx, sy, ox, oy, dragging = false;
+      $('#dfc-head').addEventListener('mousedown', e => {
+        dragging = true; sx = e.clientX; sy = e.clientY;
+        const r = box.getBoundingClientRect(); ox = r.left; oy = r.top;
+        e.preventDefault();
+      });
+      window.addEventListener('mousemove', e => {
+        if (!dragging) return;
+        box.style.left = (ox + e.clientX - sx) + 'px';
+        box.style.top = (oy + e.clientY - sy) + 'px';
+        box.style.right = 'auto';
+      });
+      window.addEventListener('mouseup', () => { dragging = false; });
+    })();
+    render();
   }
 
   // ---------- 启动 ----------
   function boot() {
     buildPanel();
-    const paintLog = () => { const el = document.querySelector('#dfc-log'); if (el) { el.textContent = (state.log || []).join('\n'); el.scrollTop = 1e6; } };
-    const isProfile = location.pathname.startsWith('/user/') && !location.pathname.includes('/user/self');
-    if (state.phase === 'scan' && isProfile) {
-      pushLog('📄 读取 ' + (state.list[state.idx] ? state.list[state.idx].name : '?') + '（' + (state.idx + 1) + '/' + state.list.length + '）');
-      paintLog();
-      scanCurrentProfile().then(async () => {
-        paintLog();
-        state.idx++;
-        saveState();
-        if (state.idx < state.list.length) {
-          await sleep(CFG.stepDelayMs);
-          location.href = 'https://www.douyin.com/user/' + state.list[state.idx].secUid;
-        } else {
-          state.phase = 'done';
-          state.log.push('✅ 扫描完成，共 ' + state.rows.length + ' 条，建议取关 ' + state.rows.filter(r => (r.verdict || '').includes('取关')).length + ' 个');
-          saveState();
-          location.href = 'https://www.douyin.com/user/self';
-        }
-      });
-    } else if (state.phase === 'unfollow' && isProfile) {
-      paintLog();
-      runUnfollowOnProfile();
-    } else if (state.phase === 'done' || (state.rows || []).length) {
+    if (state.phase === 'scan') {
+      pushLog('检测到上次扫描未完成（' + state.rows.length + '/' + (state.users.length || '?') + '），点「①」继续');
+    } else if (state.rows.length) {
       pushLog('已载入上次结果（' + state.rows.length + ' 条）。要重新扫描点「①」。');
-      paintLog();
-      if (window.__dfcRender) window.__dfcRender();
     } else {
-      pushLog('脚本已加载。先打开「我的」主页，再点「① 打开关注列表并扫描」。');
-      paintLog();
+      pushLog('脚本已加载。先停在「我的」主页，再点「① 扫描关注列表」。');
     }
   }
 
